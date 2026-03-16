@@ -21,10 +21,6 @@ struct Args {
     #[arg(short, long)]
     url: String,
 
-    /// GitLab user or access token
-    #[arg(short, long, env = "GITLAB_TOKEN", hide_env_values = true)]
-    token: String,
-
     /// GitLab username (optional)
     #[arg(long)]
     username: Option<String>,
@@ -44,7 +40,7 @@ struct GitlabFs {
 
 impl GitlabFs {
     fn check_access(&self, req: &Request) -> bool {
-        req.uid() == self.uid
+        req.uid() == self.uid || req.uid() == 0
     }
 
     fn build_attr(&self, ino: INodeNo, node: &FsNode) -> FileAttr {
@@ -95,7 +91,7 @@ impl Filesystem for GitlabFs {
         debug!("lookup(parent={}, name={})", parent.0, name_str);
         
         let parent_node = {
-            let tracker = self.tracker.lock().unwrap();
+            let tracker = self.tracker.lock().unwrap_or_else(|e| e.into_inner());
             match tracker.get_node(parent.0) {
                 Some(node) => node.clone(),
                 None => {
@@ -167,8 +163,9 @@ impl Filesystem for GitlabFs {
         };
 
         if let Some(node) = child_node {
-            let mut tracker = self.tracker.lock().unwrap();
+            let mut tracker = self.tracker.lock().unwrap_or_else(|e| e.into_inner());
             let child_ino = tracker.insert_or_get(node.clone());
+            tracker.inc_lookup(child_ino);
             let attr = self.build_attr(INodeNo(child_ino), &node);
             reply.entry(&TTL, &attr, Generation(0));
         } else {
@@ -184,7 +181,7 @@ impl Filesystem for GitlabFs {
 
         debug!("getattr(ino={})", ino.0);
         let node = {
-            let tracker = self.tracker.lock().unwrap();
+            let tracker = self.tracker.lock().unwrap_or_else(|e| e.into_inner());
             tracker.get_node(ino.0).cloned()
         };
 
@@ -223,7 +220,7 @@ impl Filesystem for GitlabFs {
         debug!("readdir(ino={}, offset={})", ino.0, offset);
         
         let node = {
-            let tracker = self.tracker.lock().unwrap();
+            let tracker = self.tracker.lock().unwrap_or_else(|e| e.into_inner());
             match tracker.get_node(ino.0) {
                 Some(n) => n.clone(),
                 None => {
@@ -315,7 +312,7 @@ impl Filesystem for GitlabFs {
         }
 
         // Iterate over collected entries, respecting the offset
-        for (i, (child_ino, ftype, name)) in entries.into_iter().enumerate().skip(offset as usize) {
+        for (i, (child_ino, ftype, name)) in entries.into_iter().enumerate().skip(usize::try_from(offset).unwrap_or(usize::MAX)) {
             if reply.add(child_ino, (i + 1) as _, ftype, &name) {
                 break;
             }
@@ -330,7 +327,7 @@ impl Filesystem for GitlabFs {
         }
 
         let node = {
-            let tracker = self.tracker.lock().unwrap();
+            let tracker = self.tracker.lock().unwrap_or_else(|e| e.into_inner());
             tracker.get_node(ino.0).cloned()
         };
 
@@ -338,7 +335,7 @@ impl Filesystem for GitlabFs {
             Some(FsNode::GitFile { project_id, branch, path }) => {
                 match self.client.download_file(project_id, &path, &branch) {
                     Ok(bytes) => {
-                        let mut cache = self.file_cache.lock().unwrap();
+                        let mut cache = self.file_cache.lock().unwrap_or_else(|e| e.into_inner());
                         let _ = cache.put(ino, bytes);
                         reply.opened(FileHandle(0), fuser::FopenFlags::empty());
                     }
@@ -346,7 +343,7 @@ impl Filesystem for GitlabFs {
                 }
             }
             Some(_) => {
-                reply.opened(FileHandle(0), fuser::FopenFlags::empty());
+                reply.error(Errno::EISDIR);
             }
             None => reply.error(Errno::ENOENT),
         }
@@ -368,17 +365,17 @@ impl Filesystem for GitlabFs {
             return;
         }
 
-        let mut cache = self.file_cache.lock().unwrap();
+        let mut cache = self.file_cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(bytes) = cache.get_mut(&ino) {
             let start = usize::try_from(offset).unwrap_or(usize::MAX);
             if start >= bytes.len() {
                 reply.data(&[]);
             } else {
-                let end = std::cmp::min(start + size as usize, bytes.len());
+                let end = std::cmp::min(start.saturating_add(size as usize), bytes.len());
                 reply.data(&bytes[start..end]);
             }
         } else {
-            reply.error(Errno::ENOENT);
+            reply.error(Errno::EBADF);
         }
     }
 
@@ -396,17 +393,23 @@ impl Filesystem for GitlabFs {
         cache.pop(&ino);
         reply.ok();
     }
+
+    fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
+        let mut tracker = self.tracker.lock().unwrap_or_else(|e| e.into_inner());
+        tracker.forget(ino.0, nlookup);
+    }
 }
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let args = Args::parse();
+    let token = std::env::var("GITLAB_TOKEN").expect("GITLAB_TOKEN environment variable is required");
 
-    let client = GitlabClient::new(args.url, args.token)?;
+    let client = GitlabClient::new(args.url, token)?;
     let fs = GitlabFs {
         client,
         tracker: Mutex::new(InodeTracker::new()),
-        file_cache: Mutex::new(LruCache::new(NonZeroUsize::new(100).unwrap())),
+        file_cache: Mutex::new(LruCache::new(NonZeroUsize::new(32).unwrap())),
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
     };

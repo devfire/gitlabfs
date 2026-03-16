@@ -3,10 +3,10 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use std::io::Read;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct GitlabClient {
-    pub(crate) url: String,
-    pub(crate) token: SecretString,
+    url: String,
+    token: SecretString,
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,8 +123,7 @@ impl GitlabClient {
         );
         let resp = self.request(&endpoint).call()?;
         let mut bytes = Vec::new();
-        // 1GB max limit to prevent OOM
-        resp.into_reader().take(1024 * 1024 * 1024).read_to_end(&mut bytes)?;
+        resp.into_reader().take(32 * 1024 * 1024).read_to_end(&mut bytes)?;
         Ok(bytes)
     }
 }

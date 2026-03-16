@@ -15,6 +15,7 @@ pub struct InodeTracker {
     next_ino: u64,
     ino_to_node: HashMap<u64, FsNode>,
     node_to_ino: HashMap<FsNode, u64>,
+    lookup_counts: HashMap<u64, u64>,
 }
 
 impl Default for InodeTracker {
@@ -29,6 +30,7 @@ impl InodeTracker {
             next_ino: 2, // 1 is root
             ino_to_node: HashMap::new(),
             node_to_ino: HashMap::new(),
+            lookup_counts: HashMap::new(),
         };
         // Insert Root at inode 1
         tracker.ino_to_node.insert(1, FsNode::Root);
@@ -49,6 +51,24 @@ impl InodeTracker {
             self.ino_to_node.insert(ino, node.clone());
             self.node_to_ino.insert(node, ino);
             ino
+        }
+    }
+
+    pub fn inc_lookup(&mut self, ino: u64) {
+        if ino == 1 { return; }
+        *self.lookup_counts.entry(ino).or_insert(0) += 1;
+    }
+
+    pub fn forget(&mut self, ino: u64, nlookup: u64) {
+        if ino == 1 { return; }
+        if let Some(count) = self.lookup_counts.get_mut(&ino) {
+            *count = count.saturating_sub(nlookup);
+            if *count == 0 {
+                self.lookup_counts.remove(&ino);
+                if let Some(node) = self.ino_to_node.remove(&ino) {
+                    self.node_to_ino.remove(&node);
+                }
+            }
         }
     }
 }
