@@ -1,11 +1,11 @@
 use clap::Parser;
 use fuser::{Errno, FileAttr, FileHandle, FileType, Filesystem, INodeNo, MountOption, ReplyAttr, ReplyDirectory, ReplyEntry, Request, Generation};
-use libc::ENOENT;
-use log::{debug, error, info};
+use log::{debug, info};
 use std::ffi::OsStr;
 use std::sync::Mutex;
-use std::collections::HashMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use lru::LruCache;
+use std::num::NonZeroUsize;
+use std::time::{Duration, UNIX_EPOCH};
 
 mod gitlab;
 use crate::gitlab::GitlabClient;
@@ -22,7 +22,7 @@ struct Args {
     url: String,
 
     /// GitLab user or access token
-    #[arg(short, long)]
+    #[arg(short, long, env = "GITLAB_TOKEN", hide_env_values = true)]
     token: String,
 
     /// GitLab username (optional)
@@ -37,23 +37,29 @@ struct Args {
 struct GitlabFs {
     client: GitlabClient,
     tracker: Mutex<InodeTracker>,
-    file_cache: Mutex<HashMap<INodeNo, Vec<u8>>>,
+    file_cache: Mutex<LruCache<INodeNo, Vec<u8>>>,
+    uid: u32,
+    gid: u32,
 }
 
 impl GitlabFs {
+    fn check_access(&self, req: &Request) -> bool {
+        req.uid() == self.uid
+    }
+
     fn build_attr(&self, ino: INodeNo, node: &FsNode) -> FileAttr {
         let (kind, size) = match node {
             FsNode::Root | FsNode::Projects | FsNode::Namespace { .. } |
             FsNode::Project { .. } | FsNode::BranchDir { .. } | FsNode::GitDir { .. } => {
                 (FileType::Directory, 0)
             }
-            FsNode::GitFile { project_id, branch, path } => {
-                // Return cached size if available, otherwise 0 for now unless queried in getattr
-                let cache = self.file_cache.lock().unwrap();
-                if let Some(bytes) = cache.get(&ino) {
+            FsNode::GitFile { project_id: _, branch: _, path: _ } => {
+                // Return cached size if available, otherwise 0
+                let cache = self.file_cache.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(bytes) = cache.peek(&ino) {
                     (FileType::RegularFile, bytes.len() as u64)
                 } else {
-                    (FileType::RegularFile, 1024 * 1024 * 1024) // 1GB dummy size so readers don't truncate early before open
+                    (FileType::RegularFile, 0)
                 }
             }
         };
@@ -69,8 +75,8 @@ impl GitlabFs {
             kind,
             perm: if kind == FileType::Directory { 0o755 } else { 0o444 },
             nlink: if kind == FileType::Directory { 2 } else { 1 },
-            uid: 501,
-            gid: 20,
+            uid: self.uid,
+            gid: self.gid,
             rdev: 0,
             blksize: 512,
             flags: 0,
@@ -79,7 +85,12 @@ impl GitlabFs {
 }
 
 impl Filesystem for GitlabFs {
-    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        if !self.check_access(req) {
+            reply.error(Errno::EACCES);
+            return;
+        }
+
         let name_str = name.to_string_lossy();
         debug!("lookup(parent={}, name={})", parent.0, name_str);
         
@@ -123,10 +134,10 @@ impl Filesystem for GitlabFs {
                 if let Ok(branches) = self.client.fetch_branches(id) {
                     branches.into_iter()
                         .find(|b| b.name == name_str.as_ref())
-                        .map(|b| FsNode::BranchDir { project_id: id, project_name: "".into(), branch: b.name })
+                        .map(|b| FsNode::BranchDir { project_id: id, branch: b.name })
                 } else { None }
             }
-            FsNode::BranchDir { project_id, project_name: _, branch } => {
+            FsNode::BranchDir { project_id, branch } => {
                 if let Ok(tree) = self.client.fetch_tree(project_id, "", &branch) {
                     tree.into_iter()
                         .find(|item| item.name == name_str.as_ref())
@@ -165,41 +176,50 @@ impl Filesystem for GitlabFs {
         }
     }
 
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+    fn getattr(&self, req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        if !self.check_access(req) {
+            reply.error(Errno::EACCES);
+            return;
+        }
+
         debug!("getattr(ino={})", ino.0);
         let node = {
             let tracker = self.tracker.lock().unwrap();
             tracker.get_node(ino.0).cloned()
         };
-        
-        if let Some(node) = node {
-            let mut attr = self.build_attr(ino, &node);
-            
-            // For files not in cache, try to fetch real size from API to make `ls -l` accurate
-            if let FsNode::GitFile { project_id, branch, path } = &node {
-                let cache = self.file_cache.lock().unwrap();
-                if !cache.contains_key(&ino) {
-                    drop(cache);
-                    if let Ok(info) = self.client.get_file_info(*project_id, path, branch) {
-                        attr.size = info.size;
+
+        match node {
+            Some(n) => {
+                let mut attr = self.build_attr(ino, &n);
+                // For files not in cache, try to fetch real size from API to make `ls -l` accurate
+                if let FsNode::GitFile { project_id, branch, path } = &n {
+                    let cache = self.file_cache.lock().unwrap_or_else(|e| e.into_inner());
+                    if !cache.contains(&ino) {
+                        drop(cache);
+                        if let Ok(info) = self.client.get_file_info(*project_id, path, branch) {
+                            attr.size = info.size;
+                        }
                     }
                 }
+                reply.attr(&TTL, &attr);
             }
-            
-            reply.attr(&TTL, &attr);
-        } else {
-            reply.error(Errno::ENOENT);
+            None => reply.error(Errno::ENOENT),
         }
     }
 
     fn readdir(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         _fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        if !self.check_access(req) {
+            reply.error(Errno::EACCES);
+            return;
+        }
+
         debug!("readdir(ino={}, offset={})", ino.0, offset);
         
         let node = {
@@ -213,86 +233,102 @@ impl Filesystem for GitlabFs {
             }
         };
 
-        if offset == 0 {
-            let _ = reply.add(ino, 0, FileType::Directory, ".");
-            let _ = reply.add(INodeNo(1), 1, FileType::Directory, "..");
-            
-            let mut children_added = 2;
-            let mut add_child = |node: FsNode, name: &str, is_dir: bool| {
-                let mut tracker = self.tracker.lock().unwrap();
-                let child_ino = tracker.insert_or_get(node);
-                let ftype = if is_dir { FileType::Directory } else { FileType::RegularFile };
-                let _ = reply.add(INodeNo(child_ino), children_added, ftype, name);
-                children_added += 1;
-            };
+        let mut entries = Vec::new();
+        entries.push((ino, FileType::Directory, ".".to_string()));
+        entries.push((INodeNo(1), FileType::Directory, "..".to_string()));
 
-            match node {
-                FsNode::Root => {
-                    add_child(FsNode::Projects, "projects", true);
-                }
-                FsNode::Projects => {
-                    if let Ok(projects) = self.client.fetch_projects() {
-                        let mut namespaces = std::collections::HashSet::new();
-                        for p in projects {
-                            if let Some(ns) = p.path_with_namespace.split('/').next() {
-                                namespaces.insert(ns.to_string());
-                            }
+        let mut tracker = self.tracker.lock().unwrap_or_else(|e| e.into_inner());
+
+        match node {
+            FsNode::Root => {
+                let child_node = FsNode::Projects;
+                let child_ino = tracker.insert_or_get(child_node);
+                entries.push((INodeNo(child_ino), FileType::Directory, "projects".to_string()));
+            }
+            FsNode::Projects => {
+                if let Ok(projects) = self.client.fetch_projects() {
+                    let mut namespaces = std::collections::HashSet::new();
+                    for p in projects {
+                        if let Some(ns) = p.path_with_namespace.split('/').next() {
+                            namespaces.insert(ns.to_string());
                         }
-                        for ns in namespaces {
-                            add_child(FsNode::Namespace { name: ns.clone() }, &ns, true);
+                    }
+                    for ns in namespaces {
+                        let child_node = FsNode::Namespace { name: ns.clone() };
+                        let child_ino = tracker.insert_or_get(child_node);
+                        entries.push((INodeNo(child_ino), FileType::Directory, ns));
+                    }
+                }
+            }
+            FsNode::Namespace { name: ns_name } => {
+                if let Ok(projects) = self.client.fetch_projects() {
+                    for p in projects {
+                        let mut parts = p.path_with_namespace.split('/');
+                        if parts.next() == Some(&ns_name) {
+                            let child_node = FsNode::Project { namespace: ns_name.clone(), name: p.path.clone(), id: p.id };
+                            let child_ino = tracker.insert_or_get(child_node);
+                            entries.push((INodeNo(child_ino), FileType::Directory, p.path));
                         }
                     }
                 }
-                FsNode::Namespace { name: ns_name } => {
-                    if let Ok(projects) = self.client.fetch_projects() {
-                        for p in projects {
-                            let mut parts = p.path_with_namespace.split('/');
-                            if parts.next() == Some(&ns_name) {
-                                add_child(FsNode::Project { namespace: ns_name.clone(), name: p.path.clone(), id: p.id }, &p.path, true);
-                            }
-                        }
+            }
+            FsNode::Project { namespace: _, name: _, id } => {
+                if let Ok(branches) = self.client.fetch_branches(id) {
+                    for b in branches {
+                        let child_node = FsNode::BranchDir { project_id: id, branch: b.name.clone() };
+                        let child_ino = tracker.insert_or_get(child_node);
+                        entries.push((INodeNo(child_ino), FileType::Directory, b.name));
                     }
                 }
-                FsNode::Project { namespace: _, name: _, id } => {
-                    if let Ok(branches) = self.client.fetch_branches(id) {
-                        for b in branches {
-                            add_child(FsNode::BranchDir { project_id: id, project_name: "".into(), branch: b.name.clone() }, &b.name, true);
-                        }
+            }
+            FsNode::BranchDir { project_id, branch } => {
+                if let Ok(tree) = self.client.fetch_tree(project_id, "", &branch) {
+                    for item in tree {
+                        let is_dir = item.item_type == "tree";
+                        let node = if is_dir {
+                            FsNode::GitDir { project_id, branch: branch.clone(), path: item.path.clone() }
+                        } else {
+                            FsNode::GitFile { project_id, branch: branch.clone(), path: item.path.clone() }
+                        };
+                        let child_ino = tracker.insert_or_get(node);
+                        let ftype = if is_dir { FileType::Directory } else { FileType::RegularFile };
+                        entries.push((INodeNo(child_ino), ftype, item.name));
                     }
                 }
-                FsNode::BranchDir { project_id, project_name: _, branch } => {
-                    if let Ok(tree) = self.client.fetch_tree(project_id, "", &branch) {
-                        for item in tree {
-                            let is_dir = item.item_type == "tree";
-                            let node = if is_dir {
-                                FsNode::GitDir { project_id, branch: branch.clone(), path: item.path }
-                            } else {
-                                FsNode::GitFile { project_id, branch: branch.clone(), path: item.path }
-                            };
-                            add_child(node, &item.name, is_dir);
-                        }
+            }
+            FsNode::GitDir { project_id, branch, path } => {
+                if let Ok(tree) = self.client.fetch_tree(project_id, &path, &branch) {
+                    for item in tree {
+                        let is_dir = item.item_type == "tree";
+                        let node = if is_dir {
+                            FsNode::GitDir { project_id, branch: branch.clone(), path: item.path.clone() }
+                        } else {
+                            FsNode::GitFile { project_id, branch: branch.clone(), path: item.path.clone() }
+                        };
+                        let child_ino = tracker.insert_or_get(node);
+                        let ftype = if is_dir { FileType::Directory } else { FileType::RegularFile };
+                        entries.push((INodeNo(child_ino), ftype, item.name));
                     }
                 }
-                FsNode::GitDir { project_id, branch, path } => {
-                    if let Ok(tree) = self.client.fetch_tree(project_id, &path, &branch) {
-                        for item in tree {
-                            let is_dir = item.item_type == "tree";
-                            let node = if is_dir {
-                                FsNode::GitDir { project_id, branch: branch.clone(), path: item.path }
-                            } else {
-                                FsNode::GitFile { project_id, branch: branch.clone(), path: item.path }
-                            };
-                            add_child(node, &item.name, is_dir);
-                        }
-                    }
-                }
-                _ => {}
+            }
+            _ => {}
+        }
+
+        // Iterate over collected entries, respecting the offset
+        for (i, (child_ino, ftype, name)) in entries.into_iter().enumerate().skip(offset as usize) {
+            if reply.add(child_ino, (i + 1) as _, ftype, &name) {
+                break;
             }
         }
         reply.ok();
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, _flags: fuser::OpenFlags, reply: fuser::ReplyOpen) {
+    fn open(&self, req: &Request, ino: INodeNo, _flags: fuser::OpenFlags, reply: fuser::ReplyOpen) {
+        if !self.check_access(req) {
+            reply.error(Errno::EACCES);
+            return;
+        }
+
         let node = {
             let tracker = self.tracker.lock().unwrap();
             tracker.get_node(ino.0).cloned()
@@ -300,26 +336,25 @@ impl Filesystem for GitlabFs {
 
         match node {
             Some(FsNode::GitFile { project_id, branch, path }) => {
-                if let Ok(bytes) = self.client.download_file(project_id, &path, &branch) {
-                    let mut cache = self.file_cache.lock().unwrap();
-                    cache.insert(ino, bytes);
-                    reply.opened(FileHandle(0), fuser::FopenFlags::empty());
-                } else {
-                    reply.error(Errno::EIO);
+                match self.client.download_file(project_id, &path, &branch) {
+                    Ok(bytes) => {
+                        let mut cache = self.file_cache.lock().unwrap();
+                        let _ = cache.put(ino, bytes);
+                        reply.opened(FileHandle(0), fuser::FopenFlags::empty());
+                    }
+                    Err(_) => reply.error(Errno::EIO),
                 }
             }
             Some(_) => {
-                reply.error(Errno::EISDIR);
+                reply.opened(FileHandle(0), fuser::FopenFlags::empty());
             }
-            None => {
-                reply.error(Errno::ENOENT);
-            }
+            None => reply.error(Errno::ENOENT),
         }
     }
 
     fn read(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         _fh: FileHandle,
         offset: u64,
@@ -328,9 +363,14 @@ impl Filesystem for GitlabFs {
         _lock_owner: Option<fuser::LockOwner>,
         reply: fuser::ReplyData,
     ) {
-        let cache = self.file_cache.lock().unwrap();
-        if let Some(bytes) = cache.get(&ino) {
-            let start = offset as usize;
+        if !self.check_access(req) {
+            reply.error(Errno::EACCES);
+            return;
+        }
+
+        let mut cache = self.file_cache.lock().unwrap();
+        if let Some(bytes) = cache.get_mut(&ino) {
+            let start = usize::try_from(offset).unwrap_or(usize::MAX);
             if start >= bytes.len() {
                 reply.data(&[]);
             } else {
@@ -338,7 +378,7 @@ impl Filesystem for GitlabFs {
                 reply.data(&bytes[start..end]);
             }
         } else {
-            reply.error(Errno::EBADF);
+            reply.error(Errno::ENOENT);
         }
     }
 
@@ -352,8 +392,8 @@ impl Filesystem for GitlabFs {
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        let mut cache = self.file_cache.lock().unwrap();
-        cache.remove(&ino);
+        let mut cache = self.file_cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.pop(&ino);
         reply.ok();
     }
 }
@@ -362,11 +402,13 @@ fn main() -> anyhow::Result<()> {
     env_logger::init();
     let args = Args::parse();
 
-    let client = GitlabClient::new(args.url, args.token);
+    let client = GitlabClient::new(args.url, args.token)?;
     let fs = GitlabFs {
         client,
         tracker: Mutex::new(InodeTracker::new()),
-        file_cache: Mutex::new(HashMap::new()),
+        file_cache: Mutex::new(LruCache::new(NonZeroUsize::new(100).unwrap())),
+        uid: unsafe { libc::getuid() },
+        gid: unsafe { libc::getgid() },
     };
 
     let mountpoint = args.mount;

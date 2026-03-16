@@ -6,7 +6,7 @@ pub enum FsNode {
     Projects,                                             // /projects
     Namespace { name: String },                           // /projects/{namespace}
     Project { namespace: String, name: String, id: u64 }, // /projects/{namespace}/{project}
-    BranchDir { project_id: u64, project_name: String, branch: String }, // /projects/.../{branch}
+    BranchDir { project_id: u64, branch: String }, // /projects/.../{branch}
     GitDir { project_id: u64, branch: String, path: String }, // /projects/.../{branch}/some/path
     GitFile { project_id: u64, branch: String, path: String }, // /projects/.../{branch}/some/file.txt
 }
@@ -38,10 +38,6 @@ impl InodeTracker {
 
     pub fn get_node(&self, ino: u64) -> Option<&FsNode> {
         self.ino_to_node.get(&ino)
-    }
-
-    pub fn get_ino(&self, node: &FsNode) -> Option<u64> {
-        self.node_to_ino.get(node).copied()
     }
 
     pub fn insert_or_get(&mut self, node: FsNode) -> u64 {
