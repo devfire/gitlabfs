@@ -1,8 +1,8 @@
 use fuser::{
-    Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, MountOption, ReplyAttr,
+    Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, ReplyAttr,
     ReplyDirectory, ReplyEntry, Request,
 };
-use log::{debug, info};
+use log::debug;
 use lru::LruCache;
 use std::ffi::OsStr;
 use std::sync::Mutex;

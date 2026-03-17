@@ -1,7 +1,7 @@
 use anyhow::Context;
 use clap::Parser;
 
-use log::{debug, error, info};
+use log::info;
 use lru::LruCache;
 
 use std::num::NonZeroUsize;
