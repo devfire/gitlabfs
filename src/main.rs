@@ -1,10 +1,13 @@
 use clap::Parser;
-use fuser::{Errno, FileAttr, FileHandle, FileType, Filesystem, INodeNo, MountOption, ReplyAttr, ReplyDirectory, ReplyEntry, Request, Generation};
+use fuser::{
+    Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, MountOption, ReplyAttr,
+    ReplyDirectory, ReplyEntry, Request,
+};
 use log::{debug, info};
-use std::ffi::OsStr;
-use std::sync::Mutex;
 use lru::LruCache;
+use std::ffi::OsStr;
 use std::num::NonZeroUsize;
+use std::sync::Mutex;
 use std::time::{Duration, UNIX_EPOCH};
 
 mod gitlab;
@@ -45,11 +48,17 @@ impl GitlabFs {
 
     fn build_attr(&self, ino: INodeNo, node: &FsNode) -> FileAttr {
         let (kind, size) = match node {
-            FsNode::Root | FsNode::Projects | FsNode::Namespace { .. } |
-            FsNode::Project { .. } | FsNode::BranchDir { .. } | FsNode::GitDir { .. } => {
-                (FileType::Directory, 0)
-            }
-            FsNode::GitFile { project_id: _, branch: _, path: _ } => {
+            FsNode::Root
+            | FsNode::Projects
+            | FsNode::Namespace { .. }
+            | FsNode::Project { .. }
+            | FsNode::BranchDir { .. }
+            | FsNode::GitDir { .. } => (FileType::Directory, 0),
+            FsNode::GitFile {
+                project_id: _,
+                branch: _,
+                path: _,
+            } => {
                 // Return cached size if available, otherwise 0
                 let cache = self.file_cache.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(bytes) = cache.peek(&ino) {
@@ -69,7 +78,11 @@ impl GitlabFs {
             ctime: UNIX_EPOCH,
             crtime: UNIX_EPOCH,
             kind,
-            perm: if kind == FileType::Directory { 0o755 } else { 0o444 },
+            perm: if kind == FileType::Directory {
+                0o755
+            } else {
+                0o444
+            },
             nlink: if kind == FileType::Directory { 2 } else { 1 },
             uid: self.uid,
             gid: self.gid,
@@ -89,7 +102,7 @@ impl Filesystem for GitlabFs {
 
         let name_str = name.to_string_lossy();
         debug!("lookup(parent={}, name={})", parent.0, name_str);
-        
+
         let parent_node = {
             let tracker = self.tracker.lock().unwrap_or_else(|e| e.into_inner());
             match tracker.get_node(parent.0) {
@@ -106,32 +119,61 @@ impl Filesystem for GitlabFs {
         // This avoids complex individual lookups (except maybe for files).
         let child_node = match parent_node {
             FsNode::Root => {
-                if name_str == "projects" { Some(FsNode::Projects) } else { None }
+                if name_str == "projects" {
+                    Some(FsNode::Projects)
+                } else {
+                    None
+                }
             }
             FsNode::Projects => {
                 if let Ok(projects) = self.client.fetch_projects() {
-                    projects.into_iter()
-                        .filter_map(|p| p.path_with_namespace.split('/').next().map(|s| s.to_string()))
+                    projects
+                        .into_iter()
+                        .filter_map(|p| {
+                            p.path_with_namespace
+                                .split('/')
+                                .next()
+                                .map(|s| s.to_string())
+                        })
                         .find(|ns| ns == name_str.as_ref())
                         .map(|ns| FsNode::Namespace { name: ns })
-                } else { None }
+                } else {
+                    None
+                }
             }
             FsNode::Namespace { name: ns_name } => {
                 if let Ok(projects) = self.client.fetch_projects() {
-                    projects.into_iter()
+                    projects
+                        .into_iter()
                         .find(|p| {
                             let mut parts = p.path_with_namespace.split('/');
                             parts.next() == Some(&ns_name) && p.path == name_str.as_ref()
                         })
-                        .map(|p| FsNode::Project { namespace: ns_name.clone(), name: p.path, id: p.id })
-                } else { None }
+                        .map(|p| FsNode::Project {
+                            namespace: ns_name.clone(),
+                            name: p.path,
+                            id: p.id,
+                        })
+                } else {
+                    None
+                }
             }
-            FsNode::Project { namespace: _, name: _, id } => {
+            FsNode::Project {
+                namespace: _,
+                name: _,
+                id,
+            } => {
                 if let Ok(branches) = self.client.fetch_branches(id) {
-                    branches.into_iter()
+                    branches
+                        .into_iter()
                         .find(|b| b.name == name_str.as_ref())
-                        .map(|b| FsNode::BranchDir { project_id: id, branch: b.name })
-                } else { None }
+                        .map(|b| FsNode::BranchDir {
+                            project_id: id,
+                            branch: b.name,
+                        })
+                } else {
+                    None
+                }
             }
             FsNode::BranchDir { project_id, branch } => {
                 if let Ok(tree) = self.client.fetch_tree(project_id, "", &branch) {
@@ -139,27 +181,51 @@ impl Filesystem for GitlabFs {
                         .find(|item| item.name == name_str.as_ref())
                         .map(|item| {
                             if item.item_type == "tree" {
-                                FsNode::GitDir { project_id, branch: branch.clone(), path: item.path }
+                                FsNode::GitDir {
+                                    project_id,
+                                    branch: branch.clone(),
+                                    path: item.path,
+                                }
                             } else {
-                                FsNode::GitFile { project_id, branch: branch.clone(), path: item.path }
+                                FsNode::GitFile {
+                                    project_id,
+                                    branch: branch.clone(),
+                                    path: item.path,
+                                }
                             }
                         })
-                } else { None }
+                } else {
+                    None
+                }
             }
-            FsNode::GitDir { project_id, branch, path } => {
+            FsNode::GitDir {
+                project_id,
+                branch,
+                path,
+            } => {
                 if let Ok(tree) = self.client.fetch_tree(project_id, &path, &branch) {
                     tree.into_iter()
                         .find(|item| item.name == name_str.as_ref())
                         .map(|item| {
                             if item.item_type == "tree" {
-                                FsNode::GitDir { project_id, branch: branch.clone(), path: item.path }
+                                FsNode::GitDir {
+                                    project_id,
+                                    branch: branch.clone(),
+                                    path: item.path,
+                                }
                             } else {
-                                FsNode::GitFile { project_id, branch: branch.clone(), path: item.path }
+                                FsNode::GitFile {
+                                    project_id,
+                                    branch: branch.clone(),
+                                    path: item.path,
+                                }
                             }
                         })
-                } else { None }
+                } else {
+                    None
+                }
             }
-            _ => None
+            _ => None,
         };
 
         if let Some(node) = child_node {
@@ -189,7 +255,12 @@ impl Filesystem for GitlabFs {
             Some(n) => {
                 let mut attr = self.build_attr(ino, &n);
                 // For files not in cache, try to fetch real size from API to make `ls -l` accurate
-                if let FsNode::GitFile { project_id, branch, path } = &n {
+                if let FsNode::GitFile {
+                    project_id,
+                    branch,
+                    path,
+                } = &n
+                {
                     let cache = self.file_cache.lock().unwrap_or_else(|e| e.into_inner());
                     if !cache.contains(&ino) {
                         drop(cache);
@@ -218,7 +289,7 @@ impl Filesystem for GitlabFs {
         }
 
         debug!("readdir(ino={}, offset={})", ino.0, offset);
-        
+
         let node = {
             let tracker = self.tracker.lock().unwrap_or_else(|e| e.into_inner());
             match tracker.get_node(ino.0) {
@@ -240,7 +311,11 @@ impl Filesystem for GitlabFs {
             FsNode::Root => {
                 let child_node = FsNode::Projects;
                 let child_ino = tracker.insert_or_get(child_node);
-                entries.push((INodeNo(child_ino), FileType::Directory, "projects".to_string()));
+                entries.push((
+                    INodeNo(child_ino),
+                    FileType::Directory,
+                    "projects".to_string(),
+                ));
             }
             FsNode::Projects => {
                 if let Ok(projects) = self.client.fetch_projects() {
@@ -262,17 +337,28 @@ impl Filesystem for GitlabFs {
                     for p in projects {
                         let mut parts = p.path_with_namespace.split('/');
                         if parts.next() == Some(&ns_name) {
-                            let child_node = FsNode::Project { namespace: ns_name.clone(), name: p.path.clone(), id: p.id };
+                            let child_node = FsNode::Project {
+                                namespace: ns_name.clone(),
+                                name: p.path.clone(),
+                                id: p.id,
+                            };
                             let child_ino = tracker.insert_or_get(child_node);
                             entries.push((INodeNo(child_ino), FileType::Directory, p.path));
                         }
                     }
                 }
             }
-            FsNode::Project { namespace: _, name: _, id } => {
+            FsNode::Project {
+                namespace: _,
+                name: _,
+                id,
+            } => {
                 if let Ok(branches) = self.client.fetch_branches(id) {
                     for b in branches {
-                        let child_node = FsNode::BranchDir { project_id: id, branch: b.name.clone() };
+                        let child_node = FsNode::BranchDir {
+                            project_id: id,
+                            branch: b.name.clone(),
+                        };
                         let child_ino = tracker.insert_or_get(child_node);
                         entries.push((INodeNo(child_ino), FileType::Directory, b.name));
                     }
@@ -283,27 +369,55 @@ impl Filesystem for GitlabFs {
                     for item in tree {
                         let is_dir = item.item_type == "tree";
                         let node = if is_dir {
-                            FsNode::GitDir { project_id, branch: branch.clone(), path: item.path.clone() }
+                            FsNode::GitDir {
+                                project_id,
+                                branch: branch.clone(),
+                                path: item.path.clone(),
+                            }
                         } else {
-                            FsNode::GitFile { project_id, branch: branch.clone(), path: item.path.clone() }
+                            FsNode::GitFile {
+                                project_id,
+                                branch: branch.clone(),
+                                path: item.path.clone(),
+                            }
                         };
                         let child_ino = tracker.insert_or_get(node);
-                        let ftype = if is_dir { FileType::Directory } else { FileType::RegularFile };
+                        let ftype = if is_dir {
+                            FileType::Directory
+                        } else {
+                            FileType::RegularFile
+                        };
                         entries.push((INodeNo(child_ino), ftype, item.name));
                     }
                 }
             }
-            FsNode::GitDir { project_id, branch, path } => {
+            FsNode::GitDir {
+                project_id,
+                branch,
+                path,
+            } => {
                 if let Ok(tree) = self.client.fetch_tree(project_id, &path, &branch) {
                     for item in tree {
                         let is_dir = item.item_type == "tree";
                         let node = if is_dir {
-                            FsNode::GitDir { project_id, branch: branch.clone(), path: item.path.clone() }
+                            FsNode::GitDir {
+                                project_id,
+                                branch: branch.clone(),
+                                path: item.path.clone(),
+                            }
                         } else {
-                            FsNode::GitFile { project_id, branch: branch.clone(), path: item.path.clone() }
+                            FsNode::GitFile {
+                                project_id,
+                                branch: branch.clone(),
+                                path: item.path.clone(),
+                            }
                         };
                         let child_ino = tracker.insert_or_get(node);
-                        let ftype = if is_dir { FileType::Directory } else { FileType::RegularFile };
+                        let ftype = if is_dir {
+                            FileType::Directory
+                        } else {
+                            FileType::RegularFile
+                        };
                         entries.push((INodeNo(child_ino), ftype, item.name));
                     }
                 }
@@ -312,7 +426,11 @@ impl Filesystem for GitlabFs {
         }
 
         // Iterate over collected entries, respecting the offset
-        for (i, (child_ino, ftype, name)) in entries.into_iter().enumerate().skip(usize::try_from(offset).unwrap_or(usize::MAX)) {
+        for (i, (child_ino, ftype, name)) in entries
+            .into_iter()
+            .enumerate()
+            .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+        {
             if reply.add(child_ino, (i + 1) as _, ftype, &name) {
                 break;
             }
@@ -332,16 +450,18 @@ impl Filesystem for GitlabFs {
         };
 
         match node {
-            Some(FsNode::GitFile { project_id, branch, path }) => {
-                match self.client.download_file(project_id, &path, &branch) {
-                    Ok(bytes) => {
-                        let mut cache = self.file_cache.lock().unwrap_or_else(|e| e.into_inner());
-                        let _ = cache.put(ino, bytes);
-                        reply.opened(FileHandle(0), fuser::FopenFlags::empty());
-                    }
-                    Err(_) => reply.error(Errno::EIO),
+            Some(FsNode::GitFile {
+                project_id,
+                branch,
+                path,
+            }) => match self.client.download_file(project_id, &path, &branch) {
+                Ok(bytes) => {
+                    let mut cache = self.file_cache.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = cache.put(ino, bytes);
+                    reply.opened(FileHandle(0), fuser::FopenFlags::empty());
                 }
-            }
+                Err(_) => reply.error(Errno::EIO),
+            },
             Some(_) => {
                 reply.error(Errno::EISDIR);
             }
@@ -403,7 +523,8 @@ impl Filesystem for GitlabFs {
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let args = Args::parse();
-    let token = std::env::var("GITLAB_TOKEN").expect("GITLAB_TOKEN environment variable is required");
+    let token =
+        std::env::var("GITLAB_TOKEN").expect("GITLAB_TOKEN environment variable is required");
 
     let client = GitlabClient::new(args.url, token)?;
     let fs = GitlabFs {
@@ -416,7 +537,7 @@ fn main() -> anyhow::Result<()> {
 
     let mountpoint = args.mount;
     let options = vec![MountOption::RO, MountOption::FSName("gitlabfs".to_string())];
-    
+
     let mut config = fuser::Config::default();
     config.mount_options = options;
 
