@@ -1,6 +1,7 @@
+use anyhow::Context;
 use clap::Parser;
 
-use log::{debug, info};
+use log::{debug, error, info};
 use lru::LruCache;
 
 use std::num::NonZeroUsize;
@@ -36,16 +37,11 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let args = Args::parse();
-    let token = match std::env::var("GITLAB_TOKEN") {
-        Ok(t) => t,
-        Err(_) => {
-            eprintln!("Error: GITLAB_TOKEN environment variable is required but not set.");
-            eprintln!("Please set it using: export GITLAB_TOKEN='your_personal_access_token'");
-            std::process::exit(1);
-        }
-    };
+
+    let token = std::env::var("GITLAB_TOKEN").context("GITLAB_TOKEN not found")?;
 
     let client = GitlabClient::new(args.url, token)?;
+
     let fs = GitlabFs {
         client,
         tracker: Mutex::new(InodeTracker::new()),
@@ -55,13 +51,24 @@ fn main() -> anyhow::Result<()> {
     };
 
     let mountpoint = args.mount;
+
+    // Validate mountpoint exists before attempting to mount
+    if !std::path::Path::new(&mountpoint).exists() {
+        anyhow::bail!("Mount point '{}' does not exist", mountpoint);
+    }
+
     let options = vec![MountOption::RO, MountOption::FSName("gitlabfs".to_string())];
 
     let mut config = fuser::Config::default();
     config.mount_options = options;
 
     info!("Mounting GitlabFS at {}...", mountpoint);
-    fuser::mount2(fs, mountpoint, &config)?;
+    fuser::mount2(fs, &mountpoint, &config)
+        .with_context(|| format!(
+            "Failed to mount at '{}'. Make sure 'fusermount'/'fusermount3' is installed \
+             (e.g. `sudo apt install fuse` or `sudo pacman -S fuse2`) and the mountpoint is a directory",
+            mountpoint
+        ))?;
 
     Ok(())
 }
