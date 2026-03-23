@@ -2,7 +2,7 @@ use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, ReplyAttr,
     ReplyDirectory, ReplyEntry, Request,
 };
-use log::debug;
+use log::{debug, warn};
 use lru::LruCache;
 use std::ffi::OsStr;
 use std::sync::Mutex;
@@ -296,34 +296,40 @@ impl Filesystem for GitlabFs {
                 ));
             }
             FsNode::Projects => {
-                if let Ok(projects) = self.client.fetch_projects() {
-                    let mut namespaces = std::collections::HashSet::new();
-                    for p in projects {
-                        if let Some(ns) = p.path_with_namespace.split('/').next() {
-                            namespaces.insert(ns.to_string());
+                match self.client.fetch_projects() {
+                    Ok(projects) => {
+                        let mut namespaces = std::collections::HashSet::new();
+                        for p in projects {
+                            if let Some(ns) = p.path_with_namespace.split('/').next() {
+                                namespaces.insert(ns.to_string());
+                            }
+                        }
+                        for ns in namespaces {
+                            let child_node = FsNode::Namespace { name: ns.clone() };
+                            let child_ino = tracker.insert_or_get(child_node);
+                            entries.push((INodeNo(child_ino), FileType::Directory, ns));
                         }
                     }
-                    for ns in namespaces {
-                        let child_node = FsNode::Namespace { name: ns.clone() };
-                        let child_ino = tracker.insert_or_get(child_node);
-                        entries.push((INodeNo(child_ino), FileType::Directory, ns));
-                    }
+                    Err(e) => warn!("readdir(Projects): fetch_projects failed: {}", e),
                 }
             }
             FsNode::Namespace { name: ns_name } => {
-                if let Ok(projects) = self.client.fetch_projects() {
-                    for p in projects {
-                        let mut parts = p.path_with_namespace.split('/');
-                        if parts.next() == Some(&ns_name) {
-                            let child_node = FsNode::Project {
-                                namespace: ns_name.clone(),
-                                name: p.path.clone(),
-                                id: p.id,
-                            };
-                            let child_ino = tracker.insert_or_get(child_node);
-                            entries.push((INodeNo(child_ino), FileType::Directory, p.path));
+                match self.client.fetch_projects() {
+                    Ok(projects) => {
+                        for p in projects {
+                            let mut parts = p.path_with_namespace.split('/');
+                            if parts.next() == Some(&ns_name) {
+                                let child_node = FsNode::Project {
+                                    namespace: ns_name.clone(),
+                                    name: p.path.clone(),
+                                    id: p.id,
+                                };
+                                let child_ino = tracker.insert_or_get(child_node);
+                                entries.push((INodeNo(child_ino), FileType::Directory, p.path));
+                            }
                         }
                     }
+                    Err(e) => warn!("readdir(Namespace '{}'): fetch_projects failed: {}", ns_name, e),
                 }
             }
             FsNode::Project {
@@ -331,42 +337,44 @@ impl Filesystem for GitlabFs {
                 name: _,
                 id,
             } => {
-                if let Ok(branches) = self.client.fetch_branches(id) {
-                    for b in branches {
-                        let child_node = FsNode::BranchDir {
-                            project_id: id,
-                            branch: b.name.clone(),
-                        };
-                        let child_ino = tracker.insert_or_get(child_node);
-                        entries.push((INodeNo(child_ino), FileType::Directory, b.name));
+                match self.client.fetch_branches(id) {
+                    Ok(branches) => {
+                        for b in branches {
+                            let child_node = FsNode::BranchDir {
+                                project_id: id,
+                                branch: b.name.clone(),
+                            };
+                            let child_ino = tracker.insert_or_get(child_node);
+                            entries.push((INodeNo(child_ino), FileType::Directory, b.name));
+                        }
                     }
+                    Err(e) => warn!("readdir(Project id={}): fetch_branches failed: {}", id, e),
                 }
             }
             FsNode::BranchDir { project_id, branch } => {
-                if let Ok(tree) = self.client.fetch_tree(project_id, "", &branch) {
-                    for item in tree {
-                        let is_dir = item.item_type == "tree";
-                        let node = if is_dir {
-                            FsNode::GitDir {
-                                project_id,
-                                branch: branch.clone(),
-                                path: item.path.clone(),
-                            }
-                        } else {
-                            FsNode::GitFile {
-                                project_id,
-                                branch: branch.clone(),
-                                path: item.path.clone(),
-                            }
-                        };
-                        let child_ino = tracker.insert_or_get(node);
-                        let ftype = if is_dir {
-                            FileType::Directory
-                        } else {
-                            FileType::RegularFile
-                        };
-                        entries.push((INodeNo(child_ino), ftype, item.name));
+                match self.client.fetch_tree(project_id, "", &branch) {
+                    Ok(tree) => {
+                        for item in tree {
+                            let is_dir = item.item_type == "tree";
+                            let node = if is_dir {
+                                FsNode::GitDir {
+                                    project_id,
+                                    branch: branch.clone(),
+                                    path: item.path.clone(),
+                                }
+                            } else {
+                                FsNode::GitFile {
+                                    project_id,
+                                    branch: branch.clone(),
+                                    path: item.path.clone(),
+                                }
+                            };
+                            let child_ino = tracker.insert_or_get(node);
+                            let ftype = if is_dir { FileType::Directory } else { FileType::RegularFile };
+                            entries.push((INodeNo(child_ino), ftype, item.name));
+                        }
                     }
+                    Err(e) => warn!("readdir(BranchDir project={} branch='{}'): fetch_tree failed: {}", project_id, branch, e),
                 }
             }
             FsNode::GitDir {
@@ -374,34 +382,35 @@ impl Filesystem for GitlabFs {
                 branch,
                 path,
             } => {
-                if let Ok(tree) = self.client.fetch_tree(project_id, &path, &branch) {
-                    for item in tree {
-                        let is_dir = item.item_type == "tree";
-                        let node = if is_dir {
-                            FsNode::GitDir {
-                                project_id,
-                                branch: branch.clone(),
-                                path: item.path.clone(),
-                            }
-                        } else {
-                            FsNode::GitFile {
-                                project_id,
-                                branch: branch.clone(),
-                                path: item.path.clone(),
-                            }
-                        };
-                        let child_ino = tracker.insert_or_get(node);
-                        let ftype = if is_dir {
-                            FileType::Directory
-                        } else {
-                            FileType::RegularFile
-                        };
-                        entries.push((INodeNo(child_ino), ftype, item.name));
+                match self.client.fetch_tree(project_id, &path, &branch) {
+                    Ok(tree) => {
+                        for item in tree {
+                            let is_dir = item.item_type == "tree";
+                            let node = if is_dir {
+                                FsNode::GitDir {
+                                    project_id,
+                                    branch: branch.clone(),
+                                    path: item.path.clone(),
+                                }
+                            } else {
+                                FsNode::GitFile {
+                                    project_id,
+                                    branch: branch.clone(),
+                                    path: item.path.clone(),
+                                }
+                            };
+                            let child_ino = tracker.insert_or_get(node);
+                            let ftype = if is_dir { FileType::Directory } else { FileType::RegularFile };
+                            entries.push((INodeNo(child_ino), ftype, item.name));
+                        }
                     }
+                    Err(e) => warn!("readdir(GitDir project={} branch='{}' path='{}'): fetch_tree failed: {}", project_id, branch, path, e),
                 }
             }
             _ => {}
         }
+
+        drop(tracker);
 
         // Iterate over collected entries, respecting the offset
         for (i, (child_ino, ftype, name)) in entries

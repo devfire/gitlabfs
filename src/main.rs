@@ -63,6 +63,7 @@ fn main() -> anyhow::Result<()> {
     config.mount_options = options;
 
     info!("Mounting GitlabFS at {}...", mountpoint);
+    eprintln!("GitlabFS mounted at '{}'. Press Ctrl+C to unmount.", mountpoint);
     fuser::mount2(fs, &mountpoint, &config)
         .with_context(|| format!(
             "Failed to mount at '{}'. Make sure 'fusermount'/'fusermount3' is installed \
